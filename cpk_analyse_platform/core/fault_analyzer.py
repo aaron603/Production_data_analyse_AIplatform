@@ -501,6 +501,181 @@ def _quick_is_fail(record_dir: Path) -> bool:
     return None   # unknown — let caller decide
 
 
+def generate_fault_barcode_list(db_path, output_path: str, log_cb=None) -> int:
+    """
+    Query fail/unknown records from the fault DB and write to an Excel file.
+
+    Columns: 条码, 完整条码, 工站, 机台, 测试时间, 状态, 故障类型,
+             失败测试项数量, 首次失败描述
+
+    Returns the number of rows written.
+    """
+    import json as _json
+    import pandas as pd
+
+    def _log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    records = fault_db.get_records(db_path, limit=10000)
+    fail_records = [r for r in records if r.get('status') in ('fail', 'unknown')]
+
+    if not fail_records:
+        _log('  [INFO] 故障条码列表：无失败/未知记录，跳过生成')
+        return 0
+
+    rows = []
+    for r in fail_records:
+        # Count failed test items
+        failed_count = 0
+        if r.get('failed_items'):
+            try:
+                failed_count = len(_json.loads(r['failed_items']))
+            except Exception:
+                pass
+
+        rows.append({
+            '条码':           r.get('barcode', ''),
+            '完整条码':       r.get('barcode_full', ''),
+            '工站':           r.get('station', ''),
+            '机台':           r.get('station_machine', ''),
+            '测试时间':       r.get('test_time', ''),
+            '状态':           r.get('status', ''),
+            '故障类型':       r.get('fault_type', ''),
+            '失败测试项数量': failed_count,
+            '首次失败描述':   r.get('first_fail_desc', ''),
+        })
+
+    df = pd.DataFrame(rows)
+    # Sort by test_time desc, then barcode
+    df.sort_values(['测试时间', '条码'], ascending=[False, True], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    try:
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='故障条码列表', index=False)
+            ws = writer.sheets['故障条码列表']
+            # Auto-fit column widths
+            for col in ws.columns:
+                max_len = max(
+                    (len(str(cell.value)) if cell.value is not None else 0)
+                    for cell in col
+                )
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+    except Exception as exc:
+        _log(f'  [ERROR] 故障条码列表写入失败: {exc}')
+        return 0
+
+    _log(f'  [INFO] 故障条码列表: {len(rows)} 条记录 → {output_path}')
+    return len(rows)
+
+
+def generate_rule_suggestions_yaml(db_path, output_path: str, log_cb=None) -> int:
+    """
+    Generate a YAML template for engineers to fill in fault relationship descriptions.
+
+    Based on _generate_fail_patterns(): lists top unclassified failed items and
+    high-frequency failed test items that lack a matching rule.
+    Engineers fill in fault_type / suggestion, then load the file via the menu.
+
+    Returns the number of suggestion entries written.
+    """
+    def _log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    patterns = _generate_fail_patterns(db_path)
+    total_fail = patterns.get('total_fail', 0)
+    if total_fail == 0:
+        _log('  [INFO] 规则建议YAML：无失败记录，跳过生成')
+        return 0
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    date_str = datetime.now().strftime('%Y%m%d')
+
+    lines = [
+        f'# 故障规则建议模板 — 由系统自动生成',
+        f'# 生成时间: {now_str}',
+        f'# 基于本次分析: {total_fail} 条失败记录',
+        f'#',
+        f'# 使用说明:',
+        f'#   1. 将下方每条建议的 fault_type 和 suggestion 填写完整',
+        f'#   2. 保存文件',
+        f'#   3. 通过菜单「工具 → 加载故障关系描述文件…」导入',
+        f'#',
+        f'# 注意: keywords 字段为系统建议关键词，可按需修改（逗号分隔）',
+        f'',
+        f'version: "1.0"',
+        f'date: "{datetime.now().strftime("%Y-%m-%d")}"',
+        f'',
+        f'rules:',
+    ]
+
+    count = 0
+
+    # Section 1: unclassified samples (highest priority — these have no rule match at all)
+    unclassified = patterns.get('unclassified_samples', [])
+    if unclassified:
+        lines.append(f'  # ── 未分类故障样本（共 {len(unclassified)} 条，前 {min(len(unclassified), 10)} 条）')
+        for sample in unclassified[:10]:
+            safe = sample.replace('"', "'").replace('\n', ' ')[:120]
+            lines += [
+                f'  - keywords: "{safe}"',
+                f'    fault_type: ""    # TODO: 请填写故障类型',
+                f'    suggestion: ""    # TODO: 请填写处置建议',
+                f'    # example_log: "{safe}"',
+                f'',
+            ]
+            count += 1
+
+    # Section 2: top failed test items without matching rules
+    top_items = patterns.get('top_failed_items', [])
+    if top_items:
+        lines.append(f'  # ── 高频失败测试项（出现次数最多的前10项）')
+        existing_kw = set()
+        for item, cnt in top_items[:10]:
+            if not item or item in existing_kw:
+                continue
+            existing_kw.add(item)
+            safe_item = item.replace('"', "'")[:80]
+            lines += [
+                f'  - keywords: "{safe_item}"    # 出现 {cnt} 次',
+                f'    fault_type: ""    # TODO: 请填写故障类型',
+                f'    suggestion: ""    # TODO: 请填写处置建议',
+                f'',
+            ]
+            count += 1
+
+    # Section 3: equipment error labels as hints (read-only reference)
+    top_equip = patterns.get('top_equip_errors', [])
+    if top_equip:
+        lines.append(f'  # ── 设备/通信错误参考（已有内置规则，如需细化可添加）')
+        for label, cnt in top_equip[:5]:
+            if not label:
+                continue
+            safe_label = label.replace('"', "'")
+            lines += [
+                f'  # - keywords: "{safe_label}"    # 出现 {cnt} 次  ← 参考，非必填',
+            ]
+        lines.append('')
+
+    if count == 0:
+        _log('  [INFO] 规则建议YAML：无未分类/高频项，跳过生成')
+        return 0
+
+    yaml_text = '\n'.join(lines)
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(yaml_text)
+    except OSError as exc:
+        _log(f'  [ERROR] 规则建议YAML写入失败: {exc}')
+        return 0
+
+    _log(f'  [INFO] 规则建议YAML模板: {count} 条建议 → {output_path}')
+    _log(f'  [INFO] 请填写 fault_type/suggestion 后，通过「工具→加载故障关系描述文件…」导入')
+    return count
+
+
 def _generate_fail_patterns(db_path) -> dict:
     """
     Summarise patterns from fail records already in the DB.

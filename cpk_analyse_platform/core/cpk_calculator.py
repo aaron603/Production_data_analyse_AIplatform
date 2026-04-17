@@ -1,11 +1,12 @@
 """
 cpk_calculator.py
 -----------------
-Reads all xlsx files from a folder and calculates CPK statistics per
+Reads all xlsx/json files from a folder and calculates CPK statistics per
 sheet / point_name, using the most recently dated file's limits as the
 unified LSL/USL.
 """
 
+import json as _json_mod
 import os
 import re
 import pandas as pd
@@ -100,6 +101,23 @@ def _get_file_time(xl: pd.ExcelFile) -> datetime:
     return datetime.min
 
 
+def _file_time_from_name(stem: str) -> datetime:
+    """
+    Parse the 14-digit timestamp embedded in filenames like
+    Test_Result_<YYYYMMDDHHMMSS>_<barcode>.
+    Returns datetime.min if no such pattern is found.
+    """
+    m = re.search(r'_(\d{14})(?:_|$)', stem)
+    if m:
+        s = m.group(1)
+        try:
+            return datetime(int(s[0:4]), int(s[4:6]), int(s[6:8]),
+                            int(s[8:10]), int(s[10:12]), int(s[12:14]))
+        except ValueError:
+            pass
+    return datetime.min
+
+
 def analyze_xlsx_folder(xlsx_folder: str, log_cb=None) -> dict:
     """
     Analyze all xlsx files in `xlsx_folder`.
@@ -171,7 +189,11 @@ def analyze_xlsx_folder(xlsx_folder: str, log_cb=None) -> dict:
             _log(f"  [ERROR] 无法打开文件 {xlsx_path.name}: {exc}")
             continue
 
-        file_time = _get_file_time(xl)
+        # Prefer filename-embedded timestamp (reliable under parallel test stations).
+        # Fall back to content start_time only if filename carries no timestamp.
+        file_time = _file_time_from_name(xlsx_path.stem)
+        if file_time == datetime.min:
+            file_time = _get_file_time(xl)
 
         for sheet in xl.sheet_names:
             try:
@@ -283,6 +305,187 @@ def analyze_xlsx_folder(xlsx_folder: str, log_cb=None) -> dict:
         _log(f"  [INFO] 已隐藏无可分析数据的Sheet: {empty_sheets}")
 
     # Summary log
+    total_sheets = len(results)
+    _log(f"  [INFO] CPK分析完成: {total_sheets} 个Sheet，"
+         f"{analysed_total} 个测试子项已分析，"
+         f"跳过固定值/非数值 {skipped_fixed} 个，样本不足 {skipped_small} 个")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# JSON folder analysis  (mirrors analyze_xlsx_folder for *_MEASUREMENT_*.json)
+# ---------------------------------------------------------------------------
+
+def analyze_json_folder(json_folder: str, log_cb=None) -> dict:
+    """
+    Analyze all JSON measurement files in `json_folder`.
+
+    JSON structure expected:
+      {
+        "DutInfo": {"SerialNumber": "...", "StartTime": "YYYY-MM-DD HH:MM:SS", ...},
+        "TestResult": [
+          {
+            "CaseName": "...",          ← sheet name
+            "TestPoints": [
+              {
+                "TestPointNumber": "...",  ← point_name
+                "TestData": "...",         ← data value
+                "LimitLow": "...",
+                "LimitHigh": "...",
+                "Result": "Pass/Fail",
+                "StartTime": "..."
+              }, ...
+            ]
+          }, ...
+        ]
+      }
+
+    Returns the same dict shape as analyze_xlsx_folder.
+    """
+    def _log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    folder = Path(json_folder)
+    json_files = sorted(folder.glob('*.json'))
+
+    if not json_files:
+        _log(f"  [WARN] CPK分析：{json_folder} 目录中未找到 json 文件")
+        return {}
+
+    _log(f"  [INFO] CPK分析目录: {json_folder}")
+    _log(f"  [INFO] 找到 {len(json_files)} 个 json 文件，开始读取数据...")
+
+    # collected[case_name][point_number] = {values, latest_time, lsl, usl}
+    collected: dict = {}
+
+    for json_path in json_files:
+        data = None
+        for enc in ('utf-8', 'utf-8-sig', 'gbk', 'latin-1'):
+            try:
+                with open(json_path, encoding=enc) as f:
+                    data = _json_mod.load(f)
+                break
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:
+                _log(f"  [ERROR] 无法解析文件 {json_path.name}: {exc}")
+                break
+
+        if data is None:
+            _log(f"  [ERROR] 无法读取文件 {json_path.name}")
+            continue
+
+        # Barcode
+        dut_info = data.get('DutInfo', {})
+        barcode = str(dut_info.get('SerialNumber', '')).strip() or json_path.stem
+
+        # File time: prefer filename timestamp, fall back to DutInfo.StartTime
+        file_time = _file_time_from_name(json_path.stem)
+        if file_time == datetime.min:
+            ts_str = dut_info.get('StartTime', '')
+            if ts_str:
+                try:
+                    file_time = datetime.strptime(str(ts_str)[:19], '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    pass
+
+        test_result = data.get('TestResult', [])
+        if not isinstance(test_result, list):
+            _log(f"  [WARN] {json_path.name}: TestResult 格式异常，已跳过")
+            continue
+
+        for case in test_result:
+            case_name = str(case.get('CaseName', 'Unknown')).strip()
+            test_points = case.get('TestPoints', [])
+            if not isinstance(test_points, list):
+                continue
+
+            if case_name not in collected:
+                collected[case_name] = {}
+
+            for pt in test_points:
+                pname = str(pt.get('TestPointNumber', '')).strip()
+                if not pname or pname.lower() == 'nan':
+                    continue
+
+                raw_val = pt.get('TestData')
+                try:
+                    val = float(raw_val)
+                except (TypeError, ValueError):
+                    continue
+
+                row_pass = str(pt.get('Result', 'Pass')).strip().lower() != 'fail'
+
+                if pname not in collected[case_name]:
+                    collected[case_name][pname] = {
+                        'values': [],
+                        'latest_time': datetime.min,
+                        'lsl': None,
+                        'usl': None,
+                    }
+
+                collected[case_name][pname]['values'].append((barcode, val, row_pass))
+
+                if file_time >= collected[case_name][pname]['latest_time']:
+                    collected[case_name][pname]['latest_time'] = file_time
+
+                    raw_lsl = pt.get('LimitLow')
+                    raw_usl = pt.get('LimitHigh')
+                    try:
+                        collected[case_name][pname]['lsl'] = (
+                            float(raw_lsl) if raw_lsl not in (None, '') else None
+                        )
+                    except (TypeError, ValueError):
+                        collected[case_name][pname]['lsl'] = None
+                    try:
+                        collected[case_name][pname]['usl'] = (
+                            float(raw_usl) if raw_usl not in (None, '') else None
+                        )
+                    except (TypeError, ValueError):
+                        collected[case_name][pname]['usl'] = None
+
+    # ── Pass 2: calculate CPK (identical logic to analyze_xlsx_folder) ────
+    results: dict = {}
+    skipped_fixed = 0
+    skipped_small = 0
+    analysed_total = 0
+
+    for sheet, points in collected.items():
+        results[sheet] = {}
+
+        for pname, data in points.items():
+            raw_values = [v for _, v, _ in data['values']]
+            lsl = data['lsl']
+            usl = data['usl']
+
+            if len(set(raw_values)) <= 1:
+                _log(f"  [SKIP] 固定值，跳过CPK: [{sheet}] {pname}"
+                     f"  (值={raw_values[0] if raw_values else '-'}，N={len(raw_values)})")
+                skipped_fixed += 1
+                continue
+
+            if len(raw_values) < 2:
+                _log(f"  [SKIP] 样本量不足，跳过CPK: [{sheet}] {pname}"
+                     f"  (N={len(raw_values)})")
+                skipped_small += 1
+                continue
+
+            stats = calculate_cpk(raw_values, lsl, usl)
+            stats['values'] = data['values']
+            n_pass = sum(1 for _, _, p in data['values'] if p)
+            stats['n_pass'] = n_pass
+            stats['n_fail'] = len(data['values']) - n_pass
+            results[sheet][pname] = stats
+            analysed_total += 1
+
+    empty_sheets = [s for s, pts in results.items() if not pts]
+    for s in empty_sheets:
+        del results[s]
+    if empty_sheets:
+        _log(f"  [INFO] 已隐藏无可分析数据的Sheet: {empty_sheets}")
+
     total_sheets = len(results)
     _log(f"  [INFO] CPK分析完成: {total_sheets} 个Sheet，"
          f"{analysed_total} 个测试子项已分析，"
