@@ -15,11 +15,39 @@ Tabs:
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
+import sys
 from collections import defaultdict
 from datetime import datetime
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Bundled Chart.js — loaded inline so reports work without internet access.
+# Falls back to CDN if the local asset file is missing.
+# ---------------------------------------------------------------------------
+def _chartjs_asset_path() -> str:
+    """Resolve chart.umd.min.js path for both dev and PyInstaller frozen modes."""
+    if getattr(sys, 'frozen', False):
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+        return os.path.join(base, 'core', 'assets', 'chart.umd.min.js')
+    return os.path.join(os.path.dirname(__file__), 'assets', 'chart.umd.min.js')
+
+_CHARTJS_ASSET = _chartjs_asset_path()
+
+
+def _chartjs_script_tag() -> str:
+    """Return a <script> tag: inline JS if asset exists, CDN fallback otherwise."""
+    try:
+        with open(_CHARTJS_ASSET, 'r', encoding='utf-8') as _f:
+            _js = _f.read()
+        return f'<script>/* Chart.js 4.4.0 bundled */\n{_js}\n</script>'
+    except OSError:
+        return (
+            '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"'
+            ' async onload="if(window._onChartJsLoaded)window._onChartJsLoaded()"></script>'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +230,14 @@ def _build_data(
                 entry = bs.get(bc, {})
                 if entry.get('pass_count', 0) > 0:
                     retry_pass_count += 1
+    else:
+        # fail_data not provided — derive never_pass from measurement values:
+        # a barcode is "never passed" if ALL its measurements failed
+        bc_has_any_pass = {
+            bc for bc, meas in bc_measurements.items()
+            if any(is_p for (_, is_p, _, _, _) in meas.values())
+        }
+        never_pass_list = sorted(fail_bcs - bc_has_any_pass)
 
     # multi_fail: barcodes with ≥2 distinct failing test items
     bc_fail_items: dict[str, list] = defaultdict(list)
@@ -404,6 +440,20 @@ def _build_data(
             fault_type_list.append({'type': '失败后重测通过', 'count': retry_pass_n})
         if persist_fail_n:
             fault_type_list.append({'type': '持续失败', 'count': persist_fail_n})
+    elif fail_bcs:
+        # fail_data not provided — heuristic classification from measurement values:
+        # barcodes with mixed pass/fail measurements → likely had a retry-pass run;
+        # barcodes with only failing measurements → persistent fail.
+        bc_has_any_pass_set = {
+            bc for bc, meas in bc_measurements.items()
+            if any(is_p for (_, is_p, _, _, _) in meas.values())
+        }
+        retry_n2 = len(fail_bcs & bc_has_any_pass_set)
+        persist_n2 = len(fail_bcs - bc_has_any_pass_set)
+        if retry_n2:
+            fault_type_list.append({'type': '失败后重测通过', 'count': retry_n2})
+        if persist_n2:
+            fault_type_list.append({'type': '持续失败', 'count': persist_n2})
 
     # ---- Step 10: sn_detail (FAIL SNs + up to 200 PASS) ----------------
     full_sn_detail: dict[str, dict] = {}
@@ -556,8 +606,17 @@ tr:hover td{background:#f0f4ff}
 
 
 def _build_html(data_dict: dict, sn_detail: dict) -> str:
-    data_json = json.dumps(data_dict, ensure_ascii=False, default=_json_default)
-    sn_json = json.dumps(sn_detail, ensure_ascii=False, default=_json_default)
+    # Pull dist_data out before serialising — it's 500KB+ and only needed when
+    # the user clicks the 数据分布 tab, so lazy-load it separately.
+    data_for_js = dict(data_dict)                    # shallow copy — safe to mutate
+    dist_data   = data_for_js.pop('dist_data', {})
+
+    data_json = json.dumps(_sanitize_for_json(data_for_js), ensure_ascii=False, default=_json_default)
+    sn_json   = json.dumps(_sanitize_for_json(sn_detail),   ensure_ascii=False, default=_json_default)
+    dist_json = json.dumps(_sanitize_for_json(dist_data),   ensure_ascii=False, default=_json_default)
+    # Escape "</script>" inside JSON so it can't prematurely close the tag
+    sn_json_safe   = sn_json.replace('</', '<\\/')
+    dist_json_safe = dist_json.replace('</', '<\\/')
 
     title = data_dict.get('title', 'CPK综合分析报告')
     generated_at = data_dict.get('generated_at', '')
@@ -576,8 +635,6 @@ def _build_html(data_dict: dict, sn_detail: dict) -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{_esc(title)}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
-  async onload="if(window._onChartJsLoaded)window._onChartJsLoaded()"></script>
 <style>{_CSS}</style>
 </head>
 <body>
@@ -739,9 +796,11 @@ def _build_html(data_dict: dict, sn_detail: dict) -> str:
 
 </div><!-- .main -->
 
+{_chartjs_script_tag()}
 <script>
 var DATA = {data_json};
-var SN_DETAIL = {sn_json};
+var SN_DETAIL = null;   // lazy-loaded on first 故障回放 tab open
+var DIST_DATA = null;   // lazy-loaded on first 数据分布 tab open
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1138,9 +1197,9 @@ function filterCpk() {{
 // ---------------------------------------------------------------------------
 var dHistInst = null;
 function initDist() {{
-  var D = DATA;
+  _ensureDistData();
   var btns = document.getElementById('distBtns');
-  var keys = Object.keys(D.dist_data);
+  var keys = Object.keys(DIST_DATA);
   if(!keys.length) {{
     btns.innerHTML = '<span style="color:#9ca3af">暂无分布数据</span>';
     return;
@@ -1159,7 +1218,8 @@ function initDist() {{
   showDist(keys[0]);
 }}
 function showDist(pname) {{
-  var D = DATA, d = D.dist_data[pname];
+  _ensureDistData();
+  var d = DIST_DATA[pname];
   if(!d) return;
   document.getElementById('distCard').style.display = 'block';
   document.getElementById('distTitle').textContent = '数据分布：'+pname;
@@ -1218,7 +1278,18 @@ function showDist(pname) {{
 // REPLAY TAB
 // ---------------------------------------------------------------------------
 var _snAll = [];
+function _ensureSNDetail() {{
+  if (!SN_DETAIL) {{
+    SN_DETAIL = JSON.parse(document.getElementById('_snDetailJson').textContent);
+  }}
+}}
+function _ensureDistData() {{
+  if (!DIST_DATA) {{
+    DIST_DATA = JSON.parse(document.getElementById('_distDataJson').textContent);
+  }}
+}}
 function initReplay() {{
+  _ensureSNDetail();
   _snAll = Object.entries(SN_DETAIL).map(function(e) {{
     var sn=e[0], d=e[1];
     return {{sn:sn, overall:d.overall, time:d.time, fc:(d.fail_items?d.fail_items.length:0)}};
@@ -1234,7 +1305,7 @@ function renderSNList(list) {{
   document.getElementById('snCnt').textContent = list.length+'个';
   document.getElementById('snList').innerHTML = list.map(function(s) {{
     var isFail = s.overall==='FAIL';
-    return '<div class="sn-item" onclick="loadSN(\''+s.sn+'\',this)">'
+    return '<div class="sn-item" data-sn="'+s.sn+'" onclick="loadSN(this.dataset.sn,this)">'
       +'<div><div class="sn-code">'+s.sn+'</div>'
       +'<div class="sn-meta">'+(s.time?s.time.slice(0,16):'')+'</div></div>'
       +'<span class="badge '+(isFail?'b-fail':'b-pass')+'">'+(isFail?'✗'+s.fc:'✓')+'</span>'
@@ -1252,6 +1323,7 @@ function filterSN() {{
 function loadSN(sn, el) {{
   document.querySelectorAll('.sn-item').forEach(function(x){{x.classList.remove('selected');}});
   el.classList.add('selected');
+  _ensureSNDetail();
   var d = SN_DETAIL[sn];
   if(!d) {{
     document.getElementById('detPane').innerHTML = '<div style="padding:20px;color:#9ca3af">数据加载失败</div>';
@@ -1316,6 +1388,8 @@ function togSh(h) {{
   h.querySelector('span:last-child').textContent = r.classList.contains('open') ? '▼' : '▶';
 }}
 </script>
+<script type="application/json" id="_snDetailJson">{sn_json_safe}</script>
+<script type="application/json" id="_distDataJson">{dist_json_safe}</script>
 </body>
 </html>"""
 
@@ -1333,12 +1407,24 @@ def _json_default(obj):
         if isinstance(obj, (np.integer,)):
             return int(obj)
         if isinstance(obj, (np.floating,)):
-            return float(obj)
+            f = float(obj)
+            return None if not math.isfinite(f) else f   # nan/inf → null
         if isinstance(obj, np.ndarray):
             return obj.tolist()
     except ImportError:
         pass
     raise TypeError(f'Object of type {type(obj).__name__} is not JSON serialisable')
+
+
+def _sanitize_for_json(obj):
+    """Recursively replace Python float NaN/Inf with None so output is valid JSON."""
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 
 def _esc(s: str) -> str:
